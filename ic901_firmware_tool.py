@@ -42,8 +42,8 @@ TMR2_VECTOR = 8
 CODE_SIZE = 0x19000
 
 # bInterval for EP82/EP83
-EP82 = rb"\x09\x21\x00\x01\x00\x01\x22.\x00\x07\x05\x82\x03\x40\x00(.)"
-EP83 = rb"\x09\x21\x00\x01\x00\x01\x22.\x00\x07\x05\x83\x03\x0c\x00(.)"
+EP82 = rb"\x09\x21\x00\x01\x00\x01\x22.\x00\x07\x05\x82\x03.\x00(.)"
+EP83 = rb"\x09\x21\x00\x01\x00\x01\x22.\x00\x07\x05\x83\x03.\x00(.)"
 
 cs = capstone.Cs(capstone.CS_ARCH_MIPS, capstone.CS_MODE_MIPS32 + capstone.CS_MODE_LITTLE_ENDIAN)
 ks = keystone.Ks(keystone.KS_ARCH_MIPS, keystone.KS_MODE_MIPS32 + keystone.KS_MODE_LITTLE_ENDIAN)
@@ -52,7 +52,7 @@ def printAddress(name, address, silent, gp=False):
     if silent:
         return
 
-    GP_REG = 0x7ff0
+    GP_REG = 0xa0007ff0
 
     if not gp:
         print(f"{name} @ 0x{address:x}")
@@ -96,7 +96,6 @@ def findCoilOnTicks(code, tmr2ISR, silent):
     if tempCoilOnTicks:
         printAddress("tempCoilOnTicks", tempCoilOnTicks, silent, gp=True)
     else:
-        print("Couldn't find tempCoilOnTicks")
         return None
 
     # find:
@@ -114,6 +113,20 @@ def findCoilOnTicks(code, tmr2ISR, silent):
     if setCoilOnTicks:
         printAddress("setCoilOnTicks", setCoilOnTicks, silent, gp=True)
     else:
+        # Some firmware set it directly at multiple places
+        arr = []
+
+        prev = None
+        for ins in code:
+            if prev and prev.id == MIPS_INS_ADDIU and ins.id == MIPS_INS_SW:
+                if prev.operands[0].reg == ins.operands[0].reg and ins.operands[1].mem.disp == tempCoilOnTicks:
+                    arr.append(prev)
+
+            prev = ins
+
+        if len(arr) > 0:
+            return arr
+
         print("Couldn't find setCoilOnTicks")
         return None
 
@@ -126,33 +139,72 @@ def findCoilOnTicks(code, tmr2ISR, silent):
                 break
         prev = ins
 
-    return _coilOnTicksIns
+    return [_coilOnTicksIns]
 
-def findADCSampler(code, tmr2ISR):
+def findADCCoilSelect(code, tmr2ISR, silent):
+    # check if it's inline first
+    selectXCoilAddr, selectYCoilAddr, scanIndexMem = findCoilSelectAddr(code, tmr2ISR)
+
+    if selectXCoilAddr and selectYCoilAddr and scanIndexMem:
+        return (selectXCoilAddr, selectYCoilAddr, scanIndexMem)
+
     # find jal to ADC sample process function
     for ins in itertools.dropwhile(lambda i: i.address < tmr2ISR, code):
         if ins.id == MIPS_INS_JAL:
-            return ins.operands[0].imm
+            samplerAddr = ins.operands[0].imm
+            printAddress("ADCSampler()", samplerAddr, silent)
+
+            # find coil select within it
+            selectXCoilAddr, selectYCoilAddr, scanIndexMem = findCoilSelectAddr(code, samplerAddr)
+            if selectXCoilAddr and selectYCoilAddr and scanIndexMem:
+                return (selectXCoilAddr, selectYCoilAddr, scanIndexMem)
 
         # end of function
-        if ins.id == MIPS_INS_ERET:
+        if ins.id == MIPS_INS_ERET or ins.id == MIPS_INS_JR:
             break
 
-    return None
+    return (None, None, None)
 
 def findADCSampleCount(code, samplerAddr):
     instructions = []
 
     # look for
-    # li        $?,0x32
-    # lw        $A, ????(gp)
-    # ????      $A (so patched firmware still can be read)
-    # andi      $A,$A,0xff
+
+    # li         $?,0x32
+    # lw         $A, ????(gp)
+    # subu/addiu $A,$A,v0 (so patched firmware still can be read)
+    # andi       $A,$A,0xff
+
     for ins in itertools.dropwhile(lambda i: i.address < samplerAddr, code):
         if len(instructions) >= 4:
             # for some reason "li $v1,0x32" in Ghidra becomes "addiu $v1, $zero, 0x32"
-            if ins.id == MIPS_INS_ANDI and ins.operands[2].imm == 0xff and instructions[-2].id == MIPS_INS_LW and instructions[-3].id == MIPS_INS_ADDIU:
+            if (ins.id == MIPS_INS_ANDI and (instructions[-1].id == MIPS_INS_SUBU or instructions[-1].id == MIPS_INS_ADDIU) and
+                ins.operands[2].imm == 0xff and instructions[-2].id == MIPS_INS_LW and
+                instructions[-3].id == MIPS_INS_ADDIU and instructions[-3].operands[2].imm == 0x32):
                 yield (instructions[-1], instructions[-3])
+                instructions = []
+
+        if ins.id == MIPS_INS_JR:
+            break
+
+        instructions.append(ins)
+
+# second variant found in fw, only has one check
+def findADCSampleCountV2(code, samplerAddr):
+    instructions = []
+
+    # look for
+
+    # lw         $?,????(gp)
+    # li         $A,0x32
+    # subu/addiu $A,$A,v0 (so patched firmware still can be read)
+    # clear      $?
+
+    for ins in itertools.dropwhile(lambda i: i.address < samplerAddr, code):
+        if len(instructions) >= 4:
+            if (instructions[-3].id == MIPS_INS_LW and instructions[-2].id == MIPS_INS_ADDIU and
+                instructions[-2].operands[2].imm == 0x32 and (instructions[-1].id == MIPS_INS_SUBU or instructions[-1].id == MIPS_INS_ADDIU)):
+                yield (instructions[-1], instructions[-2])
                 instructions = []
 
         if ins.id == MIPS_INS_JR:
@@ -186,36 +238,17 @@ def findADCMidSample(code, samplerAddr):
 
     return None
 
-def findADCSamplerScanArea(code, samplerAddr, silent):
+def findCoilSelectAddr(code, samplerAddr):
     instructions = []
-
-    # look for
-    # lbu       $A,????($gp)=>scanPhase
-    # addiu     $B, $zero, 0x2 ; 0x2 is X coil scanPhase
-    # bne       $A,$B, selectYCoil ; jump to Y coil if else if not 0x2
-    # addiu     $B, $zero, 0x5 ; delay set 0x5 still applies when jump to Y coil if else
-    # lbu       $A,0x????($gp)=>scanIndex
-    # (selectXCoil if else below)
-    # ...
-    # selectYCoil:
-    # bne       $A,$B, LAB_???? ; skip setting readYcoil
-    # lbu       $A,0x????(gp)=>scanIndex
-    # (Y coil if else below)
-
-    selectXCoilAddr = None
-    selectYCoilAddr = None
-    scanIndexMem = None
-
     for ins in itertools.dropwhile(lambda i: i.address < samplerAddr, code):
         if len(instructions) >= 5:
             if (instructions[-5].id == MIPS_INS_LBU and
                 instructions[-4].id == MIPS_INS_ADDIU and instructions[-4].operands[2].imm == 0x2 and
-                instructions[-3].id == MIPS_INS_BNE and
+                (instructions[-3].id == MIPS_INS_BNE or instructions[-3].id == MIPS_INS_BNEL) and
                 instructions[-2].id == MIPS_INS_ADDIU and instructions[-2].operands[2].imm == 0x5 and
                 instructions[-1].id == MIPS_INS_LBU
                 ):
                 scanIndexMem = instructions[-1].operands[1].mem.disp
-
                 # current address is start of X coil selector
                 selectXCoilAddr = ins.address
                 tempYCoilAddr = instructions[-3].operands[2].imm
@@ -225,17 +258,34 @@ def findADCSamplerScanArea(code, samplerAddr, silent):
                 for ins2 in itertools.dropwhile(lambda i: i.address < tempYCoilAddr, code):
                     if prev and prev.id == MIPS_INS_LBU and prev.operands[1].mem.disp == scanIndexMem:
                         selectYCoilAddr = ins2.address
-                        break
+
+                        return (selectXCoilAddr, selectYCoilAddr, scanIndexMem)
 
                     prev = ins2
-                    if ins2.id == MIPS_INS_JR:
+                    if ins2.id == MIPS_INS_JR or ins2.id == MIPS_INS_ERET:
                         break
                 break
 
-        if ins.id == MIPS_INS_JR:
+        if ins.id == MIPS_INS_JR or ins.id == MIPS_INS_ERET:
             break
 
         instructions.append(ins)
+
+    return (None, None, None)
+
+def findADCSamplerScanArea(code, selectXCoilAddr, selectYCoilAddr, scanIndexMem, silent):
+    # look for
+    # lbu       $A,????($gp)=>scanPhase
+    # addiu     $B, $zero, 0x2 ; 0x2 is X coil scanPhase
+    # bne/bnel  $A,$B, selectYCoil ; jump to Y coil if else if not 0x2
+    # addiu     $B, $zero, 0x5 ; delay set 0x5 still applies when jump to Y coil if else
+    # lbu       $A,0x????($gp)=>scanIndex
+    # (selectXCoil if else below)
+    # ...
+    # selectYCoil:
+    # bne       $A,$B, LAB_???? ; skip setting readYcoil
+    # lbu       $A,0x????(gp)=>scanIndex
+    # (Y coil if else below)
 
     if selectYCoilAddr is not None:
         printAddress("selectXCoil", selectXCoilAddr, silent)
@@ -420,7 +470,7 @@ def findDeadzoneSmoothIns(code):
     return (deadzoneAndIns, deadzoneMemIns)
 
 
-coilOnTicksIns = None
+coilOnTicksInsArr = []
 adcMaxSampleCountInsArr = [] # only used on unpatched fw
 adcSampleCountInsArr = []
 adcMidSampleIns = None
@@ -442,7 +492,7 @@ smoothDzSetInsArr = None
 
 # load instructions/offsets from firmware
 def firmware_read(filePath, silent=False):
-    global coilOnTicksIns
+    global coilOnTicksInsArr
     global adcSampleCountInsArr
     global adcMaxSampleCountInsArr
     global adcMidSampleIns
@@ -465,7 +515,7 @@ def firmware_read(filePath, silent=False):
     global smoothDzSetInsArr
 
     # clear values before reading again
-    coilOnTicksIns = None
+    coilOnTicksInsArr = []
 
     adcMaxSampleCountInsArr = []
     adcSampleCountInsArr = []
@@ -512,22 +562,22 @@ def firmware_read(filePath, silent=False):
             print("Couldn't find Timer2 ISR")
             return False
 
-        coilOnTicksIns = findCoilOnTicks(code, tmr2ISR, silent)
-        if coilOnTicksIns:
-            printAddress("coilOnTicks", coilOnTicksIns.address, silent)
+        coilOnTicksInsArr = findCoilOnTicks(code, tmr2ISR, silent)
+        if coilOnTicksInsArr and len(coilOnTicksInsArr) > 0:
+            for c in coilOnTicksInsArr:
+                printAddress("coilOnTicks", c.address, silent)
         else:
             print("Couldn't find coilOnTicks")
             return False
 
-        samplerAddr = findADCSampler(code, tmr2ISR)
-        if samplerAddr:
-            printAddress("ADCSampler()", samplerAddr, silent)
-        else:
+        selectXCoilAddr, selectYCoilAddr, scanIndexMem = findADCCoilSelect(code, tmr2ISR, silent)
+        if not selectXCoilAddr or not selectYCoilAddr or not scanIndexMem:
             print("Couldn't find ADC Sampler function")
             return False
+        else:
+            samplerAddr = selectXCoilAddr - 0x10
 
-
-        scanAreaRet = findADCSamplerScanArea(code, samplerAddr, silent)
+        scanAreaRet = findADCSamplerScanArea(code, selectXCoilAddr, selectYCoilAddr, scanIndexMem, silent)
 
         if scanAreaRet:
             scanIndexMem, selectInstructionsX, selectInstructionsY = scanAreaRet
@@ -560,21 +610,24 @@ def firmware_read(filePath, silent=False):
         adcSampleCount2Arr = list(findADCSampleCount(code, samplerAddr))
 
         if len(adcSampleCount2Arr) != 2 or not adcSampleCount2Arr[0][0].id == adcSampleCount2Arr[1][0].id:
-            print("Couldn't find ADC sample count instructions")
-            return False
-        else:
-            for i, ins in enumerate(adcSampleCount2Arr):
-                adcSampleCountInsArr.append(ins[0])
-                adcMaxSampleCountInsArr.append(ins[1])
-                printAddress(f"adcSampleCount #{i + 1}", ins[0].address, silent)
+            # Try searching for other variant of it
+            adcSampleCount2Arr = list(findADCSampleCountV2(code, samplerAddr))
+
+            if len(adcSampleCount2Arr) != 1:
+                print("Couldn't find ADC sample count instructions")
+                return False
+
+        for i, ins in enumerate(adcSampleCount2Arr):
+            adcSampleCountInsArr.append(ins[0])
+            adcMaxSampleCountInsArr.append(ins[1])
+            printAddress(f"adcSampleCount #{i + 1}", ins[0].address, silent)
 
         adcMidSampleIns = findADCMidSample(code, samplerAddr)
 
         if adcMidSampleIns:
             printAddress("adcMidSample", adcMidSampleIns.address, silent)
         else:
-            print("Couldn't find adcMidSample")
-            return False
+            print("Firmware doesn't use adcMidSample")
 
         smoothDzAndIns, smoothDzSetInsArr = findDeadzoneSmoothIns(code)
 
@@ -592,10 +645,15 @@ def firmware_read(filePath, silent=False):
             printAddress(f"smoothDzSetIns #{i}", ins.address, silent)
 
         try:
-            ep82Match = re.search(EP82, code_bytes)
-            ep83Match = re.search(EP83, code_bytes)
+            ep82Match = re.search(EP82, code_bytes, re.DOTALL)
+            ep83Match = re.search(EP83, code_bytes, re.DOTALL)
 
-            if ep82Match is None or ep83Match is None:
+            if ep82Match is None:
+                print("Couldn't find EP82")
+                raise Warning
+
+            if ep83Match is None:
+                print("Couldn't find EP83")
                 raise Warning
 
             EP82bIntervalOffset = EBASE + ep82Match.start(1)
@@ -620,21 +678,22 @@ def firmware_read(filePath, silent=False):
         return True
 
 def firmware_info():
-    print(f"coilOnTicks = {coilOnTicksIns.operands[2].imm}")
+    for c in coilOnTicksInsArr:
+        print(f"coilOnTicks = {c.operands[2].imm}")
 
     if scanArea5x5:
         print("scanArea = 5x5")
     else:
         print("scanArea = 7x7")
 
-    if adcSampleCountInsArr[0].id == MIPS_INS_ADDIU: # patched fw
-        print(f"adcSampleCount #1 = {adcSampleCountInsArr[0].operands[2].imm}")
-        print(f"adcSampleCount #2 = {adcSampleCountInsArr[1].operands[2].imm}")
-    else: # default fw
-        print(f"adcSampleCount #1 = {adcMaxSampleCountInsArr[0].operands[2].imm}-N (stock)")
-        print(f"adcSampleCount #2 = {adcMaxSampleCountInsArr[1].operands[2].imm}-N (stock)")
+    for i, ins in enumerate(adcSampleCountInsArr):
+        if ins.id == MIPS_INS_ADDIU: # patched fw
+            print(f"adcSampleCount #{i} = {ins.operands[2].imm}")
+        else: # default fw
+            print(f"adcSampleCount #{i} = {adcMaxSampleCountInsArr[i].operands[2].imm}-N (stock)")
 
-    print(f"adcMidSample = {adcMidSampleIns.operands[2].imm}")
+    if adcMidSampleIns:
+        print(f"adcMidSample = {adcMidSampleIns.operands[2].imm}")
 
     if smoothDzAndIns.id == MIPS_INS_ANDI:
         print("deadzone = AUTO")
@@ -647,7 +706,7 @@ def firmware_info():
 # load config from currently loaded firmware file
 def load_config_fw():
     cfg = {}
-    cfg['coilOnTicks'] = str(coilOnTicksIns.operands[2].imm)
+    cfg['coilOnTicks'] = str(coilOnTicksInsArr[0].operands[2].imm)
 
     if scanArea5x5:
         cfg['scanArea'] = "5x5" # patched
@@ -661,7 +720,8 @@ def load_config_fw():
     else: # default fw
         cfg['adcSampleCount'] = 'AUTO'
 
-    cfg['adcMidSample'] = str(adcMidSampleIns.operands[2].imm)
+    if adcMidSampleIns:
+        cfg['adcMidSample'] = str(adcMidSampleIns.operands[2].imm)
 
     if smoothDzAndIns.id == MIPS_INS_ANDI:
         cfg['deadzone'] = "AUTO"
@@ -686,7 +746,8 @@ def load_config_ini(cfgFile):
     cfg['scanArea'] = config['CoilScan']['scanArea']
 
     cfg['adcSampleCount'] = config['CoilScan']['adcSampleCount']
-    cfg['adcMidSample'] = config['CoilScan']['adcMidSample']
+    if adcMidSampleIns:
+        cfg['adcMidSample'] = config['CoilScan']['adcMidSample']
 
     cfg['deadzone'] = config['Smoothing']['deadzone']
 
@@ -712,8 +773,9 @@ def save_config_ini(filePath, cfg):
     config.set('CoilScan', f'; ADC sample count for each coil scan, 5 - {adcMaxSampleCount} or AUTO to use default. Use as few as possible to maximize report rate.', None)
     config.set('CoilScan', 'adcSampleCount', cfg['adcSampleCount'])
 
-    config.set('CoilScan', '; ADC middle sample, 4 to adcSampleCount-1. Recommend to either keep default or set lowest possible.')
-    config.set('CoilScan', 'adcMidSample', cfg['adcMidSample'])
+    if adcMidSampleIns:
+        config.set('CoilScan', '; ADC middle sample, 4 to adcSampleCount-1. Recommend to either keep default or set lowest possible.')
+        config.set('CoilScan', 'adcMidSample', cfg['adcMidSample'])
 
     config.add_section('Smoothing')
     config.set('Smoothing', '; Smoothing deadzone around pen 0 - 10 or AUTO. Recommend setting to 0.', None)
@@ -771,10 +833,11 @@ def firmware_patch(inPath, outPath, cfg, cfgName):
     else:
         autoSampleCount = True
 
-    cfg['adcMidSample'] = int(cfg['adcMidSample'])
-    if not 4 <= cfg['adcMidSample'] <= adcMaxSampleCount-1:
-        print(f"adcMidSample must be 4 to adcSampleCount-1 ({adcMaxSampleCount})")
-        return False
+    if adcMidSampleIns:
+        cfg['adcMidSample'] = int(cfg['adcMidSample'])
+        if not 4 <= cfg['adcMidSample'] <= adcMaxSampleCount-1:
+            print(f"adcMidSample must be 4 to adcSampleCount-1 ({adcMaxSampleCount})")
+            return False
 
     if not cfg['deadzone'] == 'AUTO':
         cfg['deadzone'] = int(cfg['deadzone'])
@@ -800,12 +863,14 @@ def firmware_patch(inPath, outPath, cfg, cfgName):
 
         def patchCoilOnTicks():
             print("Patching coilOnTicks:")
-            dst = cs.reg_name(coilOnTicksIns.operands[0].reg)
 
-            instruction = f"addiu ${dst}, $zero, 0x{cfg['coilOnTicks']:x}"
+            for c in coilOnTicksInsArr:
+                dst = cs.reg_name(c.operands[0].reg)
 
-            if not writeInstruction(buf, coilOnTicksIns, instruction):
-                return False
+                instruction = f"addiu ${dst}, $zero, 0x{cfg['coilOnTicks']:x}"
+
+                if not writeInstruction(buf, c, instruction):
+                    return False
 
             return True
 
@@ -996,8 +1061,11 @@ def firmware_patch(inPath, outPath, cfg, cfgName):
 
         print("")
 
-        if not patchADCMidSample():
-            return False
+        if adcMidSampleIns:
+            if not patchADCMidSample():
+                return False
+        else:
+            print("Skip patching ADC mid sample, firmware doesn't use it.")
 
         print("")
 
