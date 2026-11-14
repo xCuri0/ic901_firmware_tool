@@ -24,7 +24,8 @@ Enter DFU mode using `xppen-tools dfu`.
 
 After this run `xppen-tools dump backup`, **it will take 10-15 minutes to finish.** A copy of current firmware will be saved in a folder named `backup`.
 
-Unlike some other manufacturers XP-Pen/Ugee doesn't make stock firmware readily available so keep copies and/or upload it for others.
+**Each tablet firmware has it's own calibration profile set during manufacturing**, so make sure not to lose it.
+Flashing a different firmware dump from the same tablet model will use its calibration which can cause small position error.
 
 ## Usage
 Python should be installed and added to PATH.

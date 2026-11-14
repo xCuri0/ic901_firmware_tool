@@ -469,6 +469,33 @@ def findDeadzoneSmoothIns(code):
 
     return (deadzoneAndIns, deadzoneMemIns)
 
+# todo: add version for g640s
+def findLowPass(code):
+    # find
+
+    # totalDelta = v0
+
+    # sltu      v0,v1,v0
+    # beql      v0,zero,LAB_9d??????
+    # _lhu      t0,????(gp)=>filter10
+    # lhu       t0,????(gp)=>filter5
+    # li        v0,0x1
+    # beq       t0,v0,LAB_9d009128
+    # _lui      v0,DAT_0000a000
+    # lbu       v0,offset ????(filterDist)
+    # sltu      v1,v0,t0
+
+    instructions = []
+    for ins in code:
+        if len(instructions) >= 9 and (instructions[-8].id == MIPS_INS_SLTU and instructions[-7].id == MIPS_INS_BEQL and
+                                       instructions[-6].id == MIPS_INS_LHU and instructions[-5].id == MIPS_INS_LHU and
+                                       instructions[-4].id == MIPS_INS_ADDIU and (instructions[-3].id == MIPS_INS_BEQ or instructions[-3].id == MIPS_INS_J) and
+                                       instructions[-2].id == MIPS_INS_LUI and instructions[-1].id == MIPS_INS_LBU and
+                                       ins.id == MIPS_INS_SLTU
+        ):
+            return instructions[-3]
+
+        instructions.append(ins)
 
 coilOnTicksInsArr = []
 adcMaxSampleCountInsArr = [] # only used on unpatched fw
@@ -489,6 +516,8 @@ scanArea5x5 = False
 
 smoothDzAndIns = None
 smoothDzSetInsArr = None
+
+lowPassIns = None
 
 # load instructions/offsets from firmware
 def firmware_read(filePath, silent=False):
@@ -514,6 +543,8 @@ def firmware_read(filePath, silent=False):
     global smoothDzAndIns
     global smoothDzSetInsArr
 
+    global lowPassIns
+
     # clear values before reading again
     coilOnTicksInsArr = []
 
@@ -537,6 +568,7 @@ def firmware_read(filePath, silent=False):
     smoothDzAndIns = None
     smoothDzSetInsArr = None
 
+    lowPassIns = None
 
     with open(filePath, 'rb') as f:
         fSize = f.seek(0, 2)
@@ -644,6 +676,14 @@ def firmware_read(filePath, silent=False):
         for i, ins in enumerate(smoothDzSetInsArr):
             printAddress(f"smoothDzSetIns #{i}", ins.address, silent)
 
+        lowPassIns = findLowPass(code)
+
+        if (lowPassIns is None):
+            print("Couldn't find lowPassIns")
+            return False
+
+        printAddress("lowPassIns", lowPassIns.address, silent)
+
         try:
             ep82Match = re.search(EP82, code_bytes, re.DOTALL)
             ep83Match = re.search(EP83, code_bytes, re.DOTALL)
@@ -731,6 +771,11 @@ def load_config_fw():
         print("Corrupt firmware smoothing functon")
         return None
 
+    if lowPassIns.id == MIPS_INS_BEQ:
+        cfg['lowpass'] = "AUTO"
+    else:
+        cfg['lowpass'] = 0
+
     cfg['bInterval'] = str(EP82bIntervalVal)
 
     return cfg
@@ -749,6 +794,7 @@ def load_config_ini(cfgFile):
     if adcMidSampleIns:
         cfg['adcMidSample'] = config['CoilScan']['adcMidSample']
 
+    cfg['lowpass'] = config['Smoothing']['lowpass']
     cfg['deadzone'] = config['Smoothing']['deadzone']
 
     cfg['bInterval'] = config['USB']['bInterval']
@@ -778,7 +824,9 @@ def save_config_ini(filePath, cfg):
         config.set('CoilScan', 'adcMidSample', cfg['adcMidSample'])
 
     config.add_section('Smoothing')
-    config.set('Smoothing', '; Smoothing deadzone around pen 0 - 10 or AUTO. Recommend setting to 0.', None)
+    config.set('Smoothing', "; Smoothing low-pass filter 0 or AUTO. If set 0 it's highly recommended to use OpenTabletDriver plugins for filtering.", None)
+    config.set('Smoothing', 'lowpass', cfg['lowpass'])
+    config.set('Smoothing', '; Smoothing deadzone around pen 0 - 10 or AUTO. Recommend setting to 0 because it stops working correctly at high report rates.', None)
     config.set('Smoothing', 'deadzone', cfg['deadzone'])
 
     config.add_section('USB')
@@ -846,6 +894,10 @@ def firmware_patch(inPath, outPath, cfg, cfgName):
             return False
     else:
         autoDeadzone = True
+
+    if not (cfg['lowpass'] == 'AUTO' or cfg['lowpass'] == '0'):
+        print("lowpass must be 0 or AUTO")
+        return False
 
     cfg['bInterval'] = int(cfg['bInterval'])
     if not 1 <= cfg['bInterval'] <= 4:
@@ -1045,6 +1097,26 @@ def firmware_patch(inPath, outPath, cfg, cfgName):
 
             return True
 
+        def patchSmoothLP(smoothLpIns):
+            if cfg['lowpass'] == '0':
+                if not smoothLpIns.id == MIPS_INS_BEQ:
+                    print(f"{Fore.LIGHTRED_EX}Unknown instruction{Fore.RESET}")
+                    return False
+
+                jumpAddr = smoothLpIns.operands[2].imm
+                instruction = f"j 0x{jumpAddr:x}"
+
+                # without .set noreorder j becomes 8 bytes
+                if not writeInstruction(buf, smoothLpIns, ".set noreorder\n" + instruction):
+                    return False
+            else:
+                if smoothLpIns.id == MIPS_INS_J:
+                    print(f"{Fore.LIGHTRED_EX}Cannot restore AUTO smoothLowpass, input firmware must be stock{Fore.RESET}")
+                    return False
+
+                print("Keeping AUTO smoothLowpass")
+
+            return True
 
         if not patchCoilOnTicks():
             return False
@@ -1075,6 +1147,11 @@ def firmware_patch(inPath, outPath, cfg, cfgName):
         print("")
 
         if not patchbInterval():
+            return False
+
+        print("")
+
+        if not patchSmoothLP(lowPassIns):
             return False
 
         print("")
