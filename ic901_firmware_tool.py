@@ -469,7 +469,7 @@ def findDeadzoneSmoothIns(code):
 
     return (deadzoneAndIns, deadzoneMemIns)
 
-# todo: add version for g640s
+
 def findLowPass(code):
     # find
 
@@ -496,6 +496,27 @@ def findLowPass(code):
             return instructions[-3]
 
         instructions.append(ins)
+
+def findLowPass2(code):
+    # find
+
+    # addu      a1,a3,a1
+    # sw        a1,0xc(a0)=>filterX                        = ??
+    # lw        a2,0x8(v0)=>newReportY                     = ??
+    # lw        v1,0x10(a0)=>filterY                       = ??
+    # addu      v1,a2,v1
+    # sw        v1,0x10(a0)=>filterY                       = ??
+    # lbu       v0,0x18(a0)=>filterDist                    = ??
+    # addiu     v0,v0,0x1
+    # seb       v0,v0
+    # blez      v0,LAB_9d010548
+    # _sb       v0,0x18(a0)=>filterDist                    = ??
+    # lui       a0,0xa000
+    # divu      a1,v0
+
+    # todo: finding the blez instruction
+
+    return
 
 coilOnTicksInsArr = []
 adcMaxSampleCountInsArr = [] # only used on unpatched fw
